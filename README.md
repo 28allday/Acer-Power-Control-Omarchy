@@ -1,5 +1,9 @@
 # Acer Power Control - Omarchy
 
+## 🎬 Video Demo
+
+[![Watch the video](https://img.youtube.com/vi/Hq3Wk7YZY-s/0.jpg)](https://youtu.be/Hq3Wk7YZY-s)
+
 GPU power and turbo mode setup for Acer Nitro/Predator laptops running [Omarchy](https://omarchy.com).
 
 Unlocks the full GPU power range (up to 60W) by enabling the `acer_wmi` predator mode kernel module option, setting the platform profile to performance, and enabling NVIDIA Dynamic Boost via `nvidia-powerd`.
