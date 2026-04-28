@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 echo "=== Acer Nitro GPU Power Setup ==="
 echo ""
@@ -25,10 +25,12 @@ CONF="/etc/modprobe.d/acer-wmi.conf"
 # This writes a config file that the kernel reads at boot time when
 # loading the acer_wmi module. It only needs to be written once — after
 # that the file persists across reboots.
-if ! grep -qs "predator_v4=1" "$CONF" 2>/dev/null; then
+if ! grep -Eqs '^[[:space:]]*options[[:space:]]+acer_wmi[[:space:]].*predator_v4=1' "$CONF" 2>/dev/null; then
     echo "Configuring acer_wmi with predator_v4=1 ..."
     echo "options acer_wmi predator_v4=1" > "$CONF"
     echo "Written: $CONF"
+else
+    echo "acer_wmi config: already configured"
 fi
 
 # Step 2: Check if predator_v4 is active (requires reboot after first run)
@@ -75,35 +77,68 @@ echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null && \
     echo "Platform profile: performance" || \
     echo "Warning: Could not set platform profile"
 
-# Step 4: Enable nvidia-powerd for Dynamic Boost
+# Step 4: Per-GPU power tuning
 #
-# nvidia-powerd is NVIDIA's Dynamic Boost daemon. It monitors CPU and
-# GPU workloads in real time and shifts power between them dynamically.
-# For example, in a GPU-heavy game it gives more wattage to the GPU;
-# in a CPU-heavy compile it shifts power to the CPU.
-#
-# This step enables the service so it starts automatically on every
-# boot and also starts it immediately. If the service doesn't exist
-# (e.g. no NVIDIA driver installed), it's skipped gracefully.
-if systemctl is-enabled nvidia-powerd &>/dev/null; then
-    echo "nvidia-powerd: enabled"
-else
-    if systemctl enable --now nvidia-powerd &>/dev/null; then
-        echo "nvidia-powerd: enabled and started"
+# Acer Nitro/Predator ships with NVIDIA, AMD, or Intel GPUs depending
+# on the model. Detect what's present and apply the vendor-appropriate
+# power knob. The acer_wmi + platform_profile steps above already
+# unlocked the chassis side; this step is the GPU side.
+GPU_VENDORS=$(lspci -nn | grep -Ei 'VGA|3D|Display' || true)
+HAS_NVIDIA=0
+HAS_AMD=0
+HAS_INTEL=0
+echo "$GPU_VENDORS" | grep -qi 'nvidia'        && HAS_NVIDIA=1
+echo "$GPU_VENDORS" | grep -qiE 'amd|ati|advanced micro' && HAS_AMD=1
+echo "$GPU_VENDORS" | grep -qi 'intel'         && HAS_INTEL=1
+
+if [[ $HAS_NVIDIA -eq 1 ]]; then
+    # nvidia-powerd is NVIDIA's Dynamic Boost daemon. It shifts power
+    # between CPU and GPU based on workload. enable --now is a no-op if
+    # already in that state, so call it unconditionally.
+    if systemctl cat nvidia-powerd.service &>/dev/null; then
+        if systemctl enable --now nvidia-powerd &>/dev/null; then
+            echo "nvidia-powerd: enabled and started"
+        else
+            echo "nvidia-powerd: present but failed to enable"
+        fi
     else
-        echo "nvidia-powerd: not available (optional)"
+        echo "nvidia-powerd: not installed (optional, ships with nvidia-utils)"
+    fi
+
+    # Report current/max power limits via the machine-readable interface.
+    if command -v nvidia-smi &>/dev/null; then
+        echo ""
+        nvidia-smi --query-gpu=name,power.limit,power.max_limit \
+            --format=csv,noheader,nounits 2>/dev/null \
+            | awk -F', ' '{printf "GPU power limit: %s — %s W (max: %s W)\n", $1, $2, $3}'
     fi
 fi
 
-# Show current GPU power state
-#
-# Queries nvidia-smi to display the current and maximum power limits
-# so the user can verify the setup worked. After pressing the Turbo
-# key a few times, the "Current Power Limit" should climb up to 60W.
-echo ""
-CURRENT_PL=$(nvidia-smi -q -d POWER 2>/dev/null | grep "Current Power Limit" | head -1 | awk '{print $5, $6}')
-MAX_PL=$(nvidia-smi -q -d POWER 2>/dev/null | grep "Max Power Limit" | head -1 | awk '{print $5, $6}')
-echo "GPU power limit: ${CURRENT_PL:-unknown} (max: ${MAX_PL:-unknown})"
+if [[ $HAS_AMD -eq 1 ]]; then
+    # AMD dGPUs (e.g. Radeon RX 6600M in AMD-Advantage Nitro models)
+    # are tuned via amdgpu sysfs. Setting the DPM performance level to
+    # "high" pins the GPU at its top P-state; the default "auto" lets
+    # the driver scale. Done at runtime; does not survive reboot.
+    AMD_SET=0
+    for card in /sys/class/drm/card*/device; do
+        [[ -e "$card/vendor" ]] || continue
+        # AMD PCI vendor ID = 0x1002
+        [[ "$(cat "$card/vendor" 2>/dev/null)" == "0x1002" ]] || continue
+        [[ -w "$card/power_dpm_force_performance_level" ]] || continue
+        echo high > "$card/power_dpm_force_performance_level" 2>/dev/null && AMD_SET=1
+    done
+    if [[ $AMD_SET -eq 1 ]]; then
+        echo "amdgpu: power_dpm_force_performance_level=high"
+    else
+        echo "amdgpu: detected but no writable DPM control found"
+    fi
+fi
+
+if [[ $HAS_INTEL -eq 1 && $HAS_NVIDIA -eq 0 && $HAS_AMD -eq 0 ]]; then
+    # Intel-only system: platform_profile (step 3) plus intel_pstate
+    # already cover Intel iGPU power. No additional knob needed.
+    echo "Intel GPU: managed via platform_profile (no extra step)"
+fi
 
 echo ""
 echo "=== Setup complete ==="
@@ -116,8 +151,14 @@ echo "your keyboard to cycle through GPU power levels:"
 echo ""
 echo "  35W -> 40W -> 50W -> 60W (max)"
 echo ""
-echo "Press it 3-4 times until nvidia-smi shows 60W."
+echo "Press it 3-4 times until the GPU reaches 60W."
 echo ""
 echo "Quick check command:"
-echo "  nvidia-smi -q -d POWER | grep 'Current Power Limit'"
+if [[ $HAS_NVIDIA -eq 1 ]]; then
+    echo "  nvidia-smi --query-gpu=power.limit --format=csv,noheader"
+elif [[ $HAS_AMD -eq 1 ]]; then
+    echo "  cat /sys/class/drm/card*/device/hwmon/hwmon*/power1_cap 2>/dev/null"
+else
+    echo "  cat /sys/firmware/acpi/platform_profile"
+fi
 echo ""

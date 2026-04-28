@@ -6,12 +6,16 @@
 
 GPU power and turbo mode setup for Acer Nitro/Predator laptops running [Omarchy](https://omarchy.com).
 
-Unlocks the full GPU power range (up to 60W) by enabling the `acer_wmi` predator mode kernel module option, setting the platform profile to performance, and enabling NVIDIA Dynamic Boost via `nvidia-powerd`.
+Unlocks the full GPU power range (up to 60W) by enabling the `acer_wmi` predator mode kernel module option and setting the platform profile to performance. Detects the installed dGPU and applies vendor-specific tuning:
+
+- **NVIDIA**: enables `nvidia-powerd` for Dynamic Boost
+- **AMD**: sets `amdgpu` DPM performance level to `high`
+- **Intel-only**: relies on the platform profile (no extra step needed)
 
 ## Requirements
 
 - **OS**: [Omarchy](https://omarchy.com) (Arch Linux)
-- **Hardware**: Acer Nitro or Predator laptop with NVIDIA dGPU
+- **Hardware**: Acer Nitro or Predator laptop with NVIDIA, AMD, or Intel GPU
 - **Kernel**: Must have `CONFIG_ACER_WMI` enabled (default on Arch)
 
 ## Quick Start
@@ -43,9 +47,13 @@ Checks `/sys/module/acer_wmi/parameters/predator_v4` to verify the module option
 
 Writes `performance` to `/sys/firmware/acpi/platform_profile`, unlocking higher GPU power states controlled by the laptop's Embedded Controller (EC).
 
-### 4. Enable nvidia-powerd
+### 4. Per-GPU Power Tuning
 
-Enables and starts `nvidia-powerd.service` for NVIDIA Dynamic Boost, which allows the GPU to dynamically allocate power between the CPU and GPU based on workload.
+Detects the dGPU vendor via `lspci` and applies the right knob:
+
+- **NVIDIA**: enables and starts `nvidia-powerd.service` for Dynamic Boost (CPU↔GPU power shifting based on workload).
+- **AMD**: writes `high` to `/sys/class/drm/card*/device/power_dpm_force_performance_level` so the `amdgpu` driver pins the dGPU to its top P-state.
+- **Intel-only**: no extra action — the platform profile already covers Intel iGPU power.
 
 ## Usage After Setup
 
@@ -59,8 +67,16 @@ Press it 3-4 times until you reach the desired power level.
 
 ### Quick Check
 
+NVIDIA:
+
 ```bash
-nvidia-smi -q -d POWER | grep 'Current Power Limit'
+nvidia-smi --query-gpu=power.limit --format=csv,noheader
+```
+
+AMD:
+
+```bash
+cat /sys/class/drm/card*/device/power_dpm_force_performance_level
 ```
 
 ## Files Modified
@@ -69,6 +85,8 @@ nvidia-smi -q -d POWER | grep 'Current Power Limit'
 |------|---------|
 | `/etc/modprobe.d/acer-wmi.conf` | Enables `predator_v4=1` module option |
 | `/sys/firmware/acpi/platform_profile` | Set to `performance` (runtime, not persistent) |
+| `nvidia-powerd.service` | Enabled + started on NVIDIA systems (Dynamic Boost) |
+| `/sys/class/drm/card*/device/power_dpm_force_performance_level` | Set to `high` on AMD systems (runtime, not persistent) |
 
 ## Uninstalling
 
