@@ -15,6 +15,20 @@ fi
 
 CONF="/etc/modprobe.d/acer-wmi.conf"
 
+# Step 0: Sanity-check that this kernel's acer_wmi supports predator_v4
+#
+# Without this check, unsupported hardware (or a kernel built without
+# the option) would loop forever: the script would keep asking for a
+# reboot that can never make predator_v4 appear. modinfo -p lists the
+# parameters the module actually accepts, so we bail out early with a
+# clear message instead.
+if ! modinfo -p acer_wmi 2>/dev/null | grep -q "^predator_v4:"; then
+    echo "Error: this kernel's acer_wmi module does not support the"
+    echo "predator_v4 option (or the module is missing entirely)."
+    echo "This script is for Acer Predator/Nitro laptops on a recent kernel."
+    exit 1
+fi
+
 # Step 1: Ensure predator_v4 module option is configured
 #
 # The acer_wmi kernel module talks to the Acer laptop's WMI interface.
@@ -24,30 +38,43 @@ CONF="/etc/modprobe.d/acer-wmi.conf"
 #
 # This writes a config file that the kernel reads at boot time when
 # loading the acer_wmi module. It only needs to be written once — after
-# that the file persists across reboots.
-if ! grep -qs "predator_v4=1" "$CONF" 2>/dev/null; then
+# that the file persists across reboots. Any stale predator_v4 line is
+# removed first so other options in the file are preserved rather than
+# the whole file being overwritten.
+if ! grep -qs "predator_v4=1" "$CONF"; then
     echo "Configuring acer_wmi with predator_v4=1 ..."
-    echo "options acer_wmi predator_v4=1" > "$CONF"
+    [[ -f "$CONF" ]] && sed -i '/predator_v4/d' "$CONF"
+    echo "options acer_wmi predator_v4=1" >> "$CONF"
     echo "Written: $CONF"
 fi
 
-# Step 2: Check if predator_v4 is active (requires reboot after first run)
+# Step 2: Check if predator_v4 is active, reloading the module if not
 #
 # The module option from Step 1 only takes effect when the acer_wmi
-# module is loaded — which happens at boot. This step reads the live
-# kernel parameter to see if predator_v4 is actually active right now.
+# module is loaded. This step reads the live kernel parameter to see if
+# predator_v4 is actually active right now.
 #
-# If it shows "Y", we're good. If not, a reboot is needed so the
-# kernel reloads the module with the new option. The script exits here
-# on first run and asks the user to reboot, then run it again.
+# If it isn't, acer_wmi is a loadable module, so in most cases we can
+# simply unload and reload it to pick up the new option — no reboot
+# needed. The reboot prompt is only the fallback for when the reload
+# fails (e.g. the module is busy or built into the kernel).
 CURRENT=$(cat /sys/module/acer_wmi/parameters/predator_v4 2>/dev/null || echo "unknown")
 
 if [[ "$CURRENT" != "Y" ]]; then
+    echo "predator_v4 is not active yet. Trying a module reload..."
+    if modprobe -r acer_wmi 2>/dev/null && modprobe acer_wmi 2>/dev/null; then
+        CURRENT=$(cat /sys/module/acer_wmi/parameters/predator_v4 2>/dev/null || echo "unknown")
+    fi
+fi
+
+if [[ "$CURRENT" != "Y" ]]; then
     echo ""
-    echo "predator_v4 is not active yet."
-    echo "A reboot is required for the module option to take effect."
+    echo "Module reload didn't activate predator_v4."
+    echo "A reboot is required for the option to take effect."
     echo ""
-    read -p "Reboot now? [y/N] " answer
+    # "|| answer=n" keeps non-interactive runs (piped input, EOF on
+    # stdin) from being killed by set -e mid-prompt.
+    read -rp "Reboot now? [y/N] " answer || answer=n
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         echo "Rebooting..."
         systemctl reboot
@@ -67,13 +94,21 @@ echo "predator_v4: active"
 #   - balanced     (default, moderate performance)
 #   - performance  (full power, fans spin up as needed)
 #
-# Setting "performance" tells the laptop firmware to allow the CPU and
-# GPU to draw more power. This is a runtime setting — it does NOT
-# survive a reboot, so it needs to be set each time (or automated
-# via a systemd service).
-echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null && \
-    echo "Platform profile: performance" || \
-    echo "Warning: Could not set platform profile"
+# Omarchy ships power-profiles-daemon, which considers itself the owner
+# of the platform profile — a raw sysfs write behind its back can be
+# silently reset (e.g. on AC/battery events). So when the daemon is
+# running we go through powerprofilesctl, which also persists the
+# choice across reboots for free. The direct sysfs write is kept as a
+# fallback for systems without the daemon, where it is runtime-only.
+if command -v powerprofilesctl &>/dev/null && systemctl is-active --quiet power-profiles-daemon; then
+    powerprofilesctl set performance 2>/dev/null && \
+        echo "Platform profile: performance (via power-profiles-daemon, persists)" || \
+        echo "Warning: powerprofilesctl could not set the profile"
+else
+    echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null && \
+        echo "Platform profile: performance (runtime only — re-run after reboot)" || \
+        echo "Warning: Could not set platform profile"
+fi
 
 # Step 4: Enable nvidia-powerd for Dynamic Boost
 #
@@ -83,10 +118,12 @@ echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null && \
 # in a CPU-heavy compile it shifts power to the CPU.
 #
 # This step enables the service so it starts automatically on every
-# boot and also starts it immediately. If the service doesn't exist
-# (e.g. no NVIDIA driver installed), it's skipped gracefully.
-if systemctl is-enabled nvidia-powerd &>/dev/null; then
-    echo "nvidia-powerd: enabled"
+# boot and also starts it immediately. is-active (not is-enabled) is
+# checked first so a dead-but-enabled service still gets started. If
+# the service doesn't exist (e.g. no NVIDIA driver installed), it's
+# skipped gracefully.
+if systemctl is-active --quiet nvidia-powerd 2>/dev/null; then
+    echo "nvidia-powerd: running"
 else
     if systemctl enable --now nvidia-powerd &>/dev/null; then
         echo "nvidia-powerd: enabled and started"
@@ -97,26 +134,29 @@ fi
 
 # Show current GPU power state
 #
-# Queries nvidia-smi to display the current and maximum power limits
-# so the user can verify the setup worked. After pressing the Turbo
-# key a few times, the "Current Power Limit" should climb up to 60W.
+# Queries nvidia-smi (once) to display the current and maximum power
+# limits so the user can verify the setup worked. After pressing the
+# Turbo key a few times, the "Current Power Limit" should climb up
+# to 60W.
 echo ""
-CURRENT_PL=$(nvidia-smi -q -d POWER 2>/dev/null | grep "Current Power Limit" | head -1 | awk '{print $5, $6}')
-MAX_PL=$(nvidia-smi -q -d POWER 2>/dev/null | grep "Max Power Limit" | head -1 | awk '{print $5, $6}')
+POWER_INFO=$(nvidia-smi -q -d POWER 2>/dev/null || true)
+CURRENT_PL=$(grep "Current Power Limit" <<<"$POWER_INFO" | head -1 | awk '{print $5, $6}')
+MAX_PL=$(grep "Max Power Limit" <<<"$POWER_INFO" | head -1 | awk '{print $5, $6}')
 echo "GPU power limit: ${CURRENT_PL:-unknown} (max: ${MAX_PL:-unknown})"
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "The platform profile is set to 'performance' but GPU power is"
-echo "controlled by the EC (Embedded Controller) via the Turbo key."
+echo "GPU power is controlled by the EC (Embedded Controller) via the"
+echo "Turbo key."
 echo ""
 echo "After each reboot, press the TURBO KEY (NitroSense button) on"
-echo "your keyboard to cycle through GPU power levels:"
+echo "your keyboard to cycle through GPU power levels. The levels are"
+echo "defined by your machine's EC — e.g. on a Nitro 5 with a 60W GPU:"
 echo ""
-echo "  35W -> 40W -> 50W -> 60W (max)"
+echo "  35W -> 40W -> 50W -> 60W"
 echo ""
-echo "Press it 3-4 times until nvidia-smi shows 60W."
+echo "Press it a few times until nvidia-smi shows ${MAX_PL:-the GPU maximum}."
 echo ""
 echo "Quick check command:"
 echo "  nvidia-smi -q -d POWER | grep 'Current Power Limit'"
