@@ -10,7 +10,7 @@ Unlocks the full GPU power range (up to 60W) by enabling the `acer_wmi` predator
 
 ## Requirements
 
-- **OS**: [Omarchy](https://omarchy.com) (Arch Linux)
+- **OS**: [Omarchy](https://omarchy.com) (Arch Linux) — works on Omarchy 4 ("Quattro") and earlier
 - **Hardware**: Acer Nitro or Predator laptop with NVIDIA dGPU
 - **Kernel**: Must have `CONFIG_ACER_WMI` enabled (default on Arch)
 
@@ -41,7 +41,11 @@ Checks `/sys/module/acer_wmi/parameters/predator_v4` to verify the module option
 
 ### 3. Set Platform Profile to Performance
 
-Writes `performance` to `/sys/firmware/acpi/platform_profile`, unlocking higher GPU power states controlled by the laptop's Embedded Controller (EC).
+Switches the laptop to the `performance` platform profile, unlocking higher GPU power states controlled by the Embedded Controller (EC).
+
+On Omarchy 4 this goes through `omarchy-powerprofiles-set ac performance`. Omarchy 4 remembers a separate profile for mains and for battery, and re-applies it every time you log in or plug/unplug the laptop — so setting the profile any other way gets quietly undone. Recording it as the **AC** profile makes it stick, and leaves your battery profile untouched.
+
+On systems without that helper the script falls back to `powerprofilesctl`, and then to a direct write to `/sys/firmware/acpi/platform_profile`.
 
 ### 4. Enable nvidia-powerd
 
@@ -68,13 +72,17 @@ nvidia-smi -q -d POWER | grep 'Current Power Limit'
 | Path | Purpose |
 |------|---------|
 | `/etc/modprobe.d/acer-wmi.conf` | Enables `predator_v4=1` module option |
-| `/sys/firmware/acpi/platform_profile` | Set to `performance` (runtime, not persistent) |
+| `~/.local/state/omarchy/powerprofiles/ac` | Records `performance` as your on-mains profile (Omarchy 4) |
+| `/sys/firmware/acpi/platform_profile` | Set to `performance` (fallback path only, runtime, not persistent) |
 
 ## Uninstalling
 
 ```bash
 # Remove module config
 sudo rm -f /etc/modprobe.d/acer-wmi.conf
+
+# Go back to the balanced profile on mains (Omarchy 4)
+omarchy-powerprofiles-set ac balanced
 
 # Disable nvidia-powerd if desired
 sudo systemctl disable nvidia-powerd

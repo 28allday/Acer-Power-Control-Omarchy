@@ -94,15 +94,37 @@ echo "predator_v4: active"
 #   - balanced     (default, moderate performance)
 #   - performance  (full power, fans spin up as needed)
 #
-# Omarchy ships power-profiles-daemon, which considers itself the owner
-# of the platform profile — a raw sysfs write behind its back can be
-# silently reset (e.g. on AC/battery events). So when the daemon is
-# running we go through powerprofilesctl, which also persists the
-# choice across reboots for free. The direct sysfs write is kept as a
-# fallback for systems without the daemon, where it is runtime-only.
-if command -v powerprofilesctl &>/dev/null && systemctl is-active --quiet power-profiles-daemon; then
+# There are three ways to set it, tried best-first:
+#
+#   1. omarchy-powerprofiles-set — Omarchy 4 keeps its own record of the
+#      profile you want on AC and on battery, and re-applies it at every
+#      session start and every AC/battery transition. A plain
+#      powerprofilesctl call is therefore undone the next time you log in
+#      or unplug the laptop. Going through the helper stores the choice
+#      where Omarchy looks for it, so it survives both. The "ac" key is
+#      the one we want: this unlocks wattage that only matters on mains,
+#      and it leaves the battery profile alone.
+#
+#      The record lives under the user's home, so this must run as the
+#      invoking user rather than as root — otherwise it lands in root's
+#      home and the desktop session never sees it.
+#
+#   2. powerprofilesctl — for a plain power-profiles-daemon system with
+#      no Omarchy helper. The daemon considers itself the owner of the
+#      platform profile, so a raw sysfs write behind its back can be
+#      silently reset.
+#
+#   3. A direct sysfs write — last resort for systems with no daemon at
+#      all, where the setting is runtime-only and lost on reboot.
+if [[ -n "${SUDO_USER:-}" ]] && command -v omarchy-powerprofiles-set &>/dev/null; then
+    if sudo -u "$SUDO_USER" omarchy-powerprofiles-set ac performance; then
+        echo "Platform profile: performance on AC (via Omarchy, remembered)"
+    else
+        echo "Warning: omarchy-powerprofiles-set could not set the profile"
+    fi
+elif command -v powerprofilesctl &>/dev/null && systemctl is-active --quiet power-profiles-daemon; then
     powerprofilesctl set performance 2>/dev/null && \
-        echo "Platform profile: performance (via power-profiles-daemon, persists)" || \
+        echo "Platform profile: performance (via power-profiles-daemon)" || \
         echo "Warning: powerprofilesctl could not set the profile"
 else
     echo "performance" > /sys/firmware/acpi/platform_profile 2>/dev/null && \
